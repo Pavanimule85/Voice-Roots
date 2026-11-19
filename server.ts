@@ -172,6 +172,85 @@ async function startServer() {
     res.json(evaluateMetrics(referenceText, hypothesisText));
   });
 
+  function sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function extractGeminiErrorInfo(err: unknown): { status: number; message: string; isTransient: boolean } {
+    const rawMsg = err instanceof Error ? err.message : String(err || 'Upstream AI request failed.');
+    let status = typeof (err as { status?: unknown })?.status === 'number'
+      ? (err as { status: number }).status
+      : 500;
+    let message = rawMsg;
+
+    try {
+      const jsonStart = rawMsg.indexOf('{');
+      if (jsonStart !== -1) {
+        const parsed = JSON.parse(rawMsg.slice(jsonStart)) as {
+          error?: { code?: number; message?: string; status?: string };
+          message?: string;
+        };
+        if (parsed?.error) {
+          if (typeof parsed.error.code === 'number') status = parsed.error.code;
+          if (typeof parsed.error.message === 'string') message = parsed.error.message;
+        } else if (typeof parsed?.message === 'string') {
+          message = parsed.message;
+        }
+      }
+    } catch {
+      // Keep rawMsg if not JSON
+    }
+
+    const lower = `${rawMsg} ${message}`.toLowerCase();
+    if (status === 500 && (lower.includes('503') || lower.includes('unavailable') || lower.includes('high demand'))) {
+      status = 503;
+    } else if (status === 500 && (lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota'))) {
+      status = 429;
+    }
+
+    const isTransient =
+      status === 503 ||
+      status === 429 ||
+      lower.includes('high demand') ||
+      lower.includes('unavailable') ||
+      lower.includes('overloaded') ||
+      lower.includes('timed out') ||
+      lower.includes('econnreset');
+
+    return { status, message, isTransient };
+  }
+
+  async function generateWithFallback(
+    ai: GoogleGenAI,
+    models: string[],
+    buildConfig: (model: string) => Parameters<GoogleGenAI['models']['generateContent']>[0]
+  ) {
+    let lastErr: unknown;
+    for (let mIdx = 0; mIdx < models.length; mIdx++) {
+      const model = models[mIdx];
+      const maxAttempts = mIdx === 0 ? 2 : 2;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const response = await ai.models.generateContent(buildConfig(model));
+          return { response, modelUsed: model };
+        } catch (err) {
+          lastErr = err;
+          const info = extractGeminiErrorInfo(err);
+          console.warn(`Gemini call failed [model=${model}, attempt=${attempt}, status=${info.status}]: ${info.message}`);
+          if (info.status === 400 || info.status === 401 || info.status === 403) {
+            throw err;
+          }
+          if (info.isTransient && attempt < maxAttempts) {
+            await sleep(500 * attempt);
+            continue;
+          }
+          break;
+        }
+      }
+    }
+    throw lastErr;
+  }
+
   app.post('/api/transcribe', async (req: Request, res: Response) => {
     try {
       const { audioBase64, mimeType, sourceDialect, targetLanguage } = req.body ?? {};
@@ -192,19 +271,21 @@ async function startServer() {
 
       const ai = getGeminiClient();
 
-      // Multimodal audio transcription + translation + IPA + grammar via gemini-4-hydrogen
-      const analysisResp = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: cleanMime,
-                data: audioBase64,
+      const { response: analysisResp, modelUsed } = await generateWithFallback(
+        ai,
+        ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'],
+        (model) => ({
+          model,
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: cleanMime,
+                  data: audioBase64,
+                },
               },
-            },
-            {
-              text: `You are an expert Indian computational linguist specializing in low-resource and endangered dialects.
+              {
+                text: `You are an expert Indian computational linguist specializing in low-resource and endangered dialects.
 Listen carefully to this spoken ${dialect} audio clip.
 Target Translation Language: ${target}
 
@@ -214,25 +295,28 @@ Return a JSON object with:
 3. translatedText: Accurate, natural translation into ${target} preserving cultural idioms and register.
 4. phoneticIpa: Phonetic IPA + Romanized pronunciation guide for the utterance.
 5. grammarSuggestions: Concise grammatical breakdown (morphology, postpositions, verb agreement, and suggested normalization or preservation notes).`,
-            },
-          ],
-        },
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              rawTranscript: { type: Type.STRING },
-              cleanedTranscript: { type: Type.STRING },
-              translatedText: { type: Type.STRING },
-              phoneticIpa: { type: Type.STRING },
-              grammarSuggestions: { type: Type.STRING },
-            },
-            required: ['rawTranscript', 'cleanedTranscript', 'translatedText', 'phoneticIpa', 'grammarSuggestions'],
+              },
+            ],
           },
-        },
-      });
+          config: {
+            thinkingConfig: {
+              thinkingLevel: model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+            },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                rawTranscript: { type: Type.STRING },
+                cleanedTranscript: { type: Type.STRING },
+                translatedText: { type: Type.STRING },
+                phoneticIpa: { type: Type.STRING },
+                grammarSuggestions: { type: Type.STRING },
+              },
+              required: ['rawTranscript', 'cleanedTranscript', 'translatedText', 'phoneticIpa', 'grammarSuggestions'],
+            },
+          },
+        })
+      );
 
       const parsed = JSON.parse((analysisResp.text ?? '{}').trim() || '{}');
       const rawTranscript = (parsed.rawTranscript || parsed.cleanedTranscript || '').trim();
@@ -247,12 +331,19 @@ Return a JSON object with:
         translatedText: parsed.translatedText || '',
         phoneticIpa: parsed.phoneticIpa || '',
         grammarSuggestions: parsed.grammarSuggestions || '',
-        modelUsed: 'gemini-4-hydrogen (Multimodal Audio ASR + Translation)',
+        modelUsed: `${modelUsed} (Multimodal Audio ASR + Translation)`,
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Transcription failed.';
-      console.error('Error in /api/transcribe:', msg);
-      res.status(500).json({ error: msg });
+      const info = extractGeminiErrorInfo(err);
+      console.error('Error in /api/transcribe:', info.message);
+      const httpStatus = info.status >= 400 && info.status < 600 ? info.status : 500;
+      res.status(httpStatus).json({
+        error: info.status === 503
+          ? 'Cloud transcription & translation models are experiencing high demand right now. Please retry shortly or use a downloaded Offline Language Pack.'
+          : info.message,
+        code: info.status,
+        retryable: info.isTransient,
+      });
     }
   });
 
@@ -267,40 +358,53 @@ Return a JSON object with:
       const target = typeof targetLanguage === 'string' && targetLanguage.trim() ? targetLanguage : 'English';
 
       const ai = getGeminiClient();
-      const resp = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `You are an expert Indian computational linguist preserving low-resource dialects.
+      const { response: resp, modelUsed } = await generateWithFallback(
+        ai,
+        ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'],
+        (model) => ({
+          model,
+          contents: `You are an expert Indian computational linguist preserving low-resource dialects.
 Source Dialect: ${dialect}
 Target Language: ${target}
 Input Utterance: """${text.trim()}"""
 
 Translate accurately into ${target}, provide an IPA/Romanized phonetic guide, and give grammar suggestions & heritage morphological notes.`,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              translatedText: { type: Type.STRING },
-              phoneticIpa: { type: Type.STRING },
-              grammarSuggestions: { type: Type.STRING },
+          config: {
+            thinkingConfig: {
+              thinkingLevel: model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
             },
-            required: ['translatedText', 'phoneticIpa', 'grammarSuggestions'],
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                translatedText: { type: Type.STRING },
+                phoneticIpa: { type: Type.STRING },
+                grammarSuggestions: { type: Type.STRING },
+              },
+              required: ['translatedText', 'phoneticIpa', 'grammarSuggestions'],
+            },
           },
-        },
-      });
+        })
+      );
 
       const parsed = JSON.parse((resp.text ?? '{}').trim() || '{}');
       res.json({
         translatedText: parsed.translatedText || '',
         phoneticIpa: parsed.phoneticIpa || '',
         grammarSuggestions: parsed.grammarSuggestions || '',
-        modelUsed: 'gemini-4-hydrogen',
+        modelUsed,
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Translation failed.';
-      console.error('Error in /api/translate:', msg);
-      res.status(500).json({ error: msg });
+      const info = extractGeminiErrorInfo(err);
+      console.error('Error in /api/translate:', info.message);
+      const httpStatus = info.status >= 400 && info.status < 600 ? info.status : 500;
+      res.status(httpStatus).json({
+        error: info.status === 503
+          ? 'Cloud translation models are temporarily experiencing high demand. Please retry in a moment or use a downloaded Offline Language Pack.'
+          : info.message,
+        code: info.status,
+        retryable: info.isTransient,
+      });
     }
   });
 

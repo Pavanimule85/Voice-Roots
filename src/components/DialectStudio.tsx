@@ -107,6 +107,7 @@ export const DialectStudio: React.FC<DialectStudioProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [packBusy, setPackBusy] = useState(false);
+  const [offerOfflineAction, setOfferOfflineAction] = useState<'audio' | 'text' | null>(null);
   const [statusBanner, setStatusBanner] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -374,58 +375,66 @@ export const DialectStudio: React.FC<DialectStudioProps> = ({
     }
     setIsProcessing(true);
     setStatusBanner(null);
+    setOfferOfflineAction(null);
+
+    const runLocalAudioFallback = async (bannerText: string, bannerType: 'info' | 'success' = 'info', packOverride?: LanguagePack) => {
+      const pack = packOverride || installedPack;
+      if (!pack) {
+        throw new Error(
+          `No local pack is installed for ${activeDialect.name}. Download the offline language pack to translate locally.`
+        );
+      }
+      const localRes = runOfflineAudioTranscription(pack, liveSpeechPreview, targetLanguage);
+      setSourceTranscript(localRes.sourceTranscript);
+      setTranslatedText(localRes.translatedText);
+      setPhoneticIpa(localRes.phoneticIpa);
+      setGrammarNotes(localRes.grammarSuggestions);
+      setModelTag(`Offline Local Pack (${pack.iso} v${pack.version})`);
+
+      const audioBase64 = await blobToBase64(audioBlob);
+      const queueItem: OfflineQueueItem = {
+        id: `offline_${Date.now()}`,
+        title: title.trim() || `${activeDialect.name} Field Capture`,
+        sourceDialect: activeDialect.name,
+        targetLanguage,
+        department: userProfile?.department || activeDialect.department,
+        audioBase64,
+        mimeType: audioBlob.type || 'audio/webm',
+        audioDurationSec: recordingSec || 6,
+        sourceType: audioSourceType,
+        sourceTranscript: localRes.sourceTranscript,
+        translatedText: localRes.translatedText,
+        phoneticIpa: localRes.phoneticIpa,
+        grammarNotes: localRes.grammarSuggestions,
+        referenceTranscript: referenceTranscript.trim() || localRes.sourceTranscript,
+        isEncrypted: encryptOnSave,
+        encryptedPayload: '',
+        createdAtIso: new Date().toISOString(),
+        syncStatus: 'pending',
+      };
+      if (encryptOnSave && vaultPassphrase) {
+        queueItem.encryptedPayload = await encryptPayload(
+          {
+            sourceTranscript: localRes.sourceTranscript,
+            translatedText: localRes.translatedText,
+            grammarNotes: localRes.grammarSuggestions,
+          },
+          vaultPassphrase
+        );
+      }
+      await enqueueOfflineItem(queueItem);
+      await onQueueChanged();
+      setStatusBanner({
+        type: bannerType,
+        text: bannerText,
+      });
+    };
 
     try {
       if (!isOnline) {
-        if (!installedPack) {
-          throw new Error(
-            `You are currently offline and no local pack is installed for ${activeDialect.name}. Reconnect or install a language pack first.`
-          );
-        }
-        const localRes = runOfflineAudioTranscription(installedPack, liveSpeechPreview, targetLanguage);
-        setSourceTranscript(localRes.sourceTranscript);
-        setTranslatedText(localRes.translatedText);
-        setPhoneticIpa(localRes.phoneticIpa);
-        setGrammarNotes(localRes.grammarSuggestions);
-        setModelTag(`Offline Local Pack (${installedPack.iso} v${installedPack.version})`);
-
-        const audioBase64 = await blobToBase64(audioBlob);
-        const queueItem: OfflineQueueItem = {
-          id: `offline_${Date.now()}`,
-          title: title.trim() || `${activeDialect.name} Field Capture`,
-          sourceDialect: activeDialect.name,
-          targetLanguage,
-          department: userProfile?.department || activeDialect.department,
-          audioBase64,
-          mimeType: audioBlob.type || 'audio/webm',
-          audioDurationSec: recordingSec || 6,
-          sourceType: audioSourceType,
-          sourceTranscript: localRes.sourceTranscript,
-          translatedText: localRes.translatedText,
-          phoneticIpa: localRes.phoneticIpa,
-          grammarNotes: localRes.grammarSuggestions,
-          referenceTranscript: referenceTranscript.trim() || localRes.sourceTranscript,
-          isEncrypted: encryptOnSave,
-          encryptedPayload: '',
-          createdAtIso: new Date().toISOString(),
-          syncStatus: 'pending',
-        };
-        if (encryptOnSave && vaultPassphrase) {
-          queueItem.encryptedPayload = await encryptPayload(
-            {
-              sourceTranscript: localRes.sourceTranscript,
-              translatedText: localRes.translatedText,
-              grammarNotes: localRes.grammarSuggestions,
-            },
-            vaultPassphrase
-          );
-        }
-        await enqueueOfflineItem(queueItem);
-        await onQueueChanged();
-        setStatusBanner({
-          type: 'info',
-          text: 'Transcribed & translated locally using your downloaded dialect pack. Queued for cloud synchronization on reconnect.',
-        });
+        await runLocalAudioFallback(
+          'Transcribed & translated locally using your downloaded dialect pack. Queued for cloud synchronization on reconnect.'
+        );
         return;
       }
 
@@ -442,6 +451,15 @@ export const DialectStudio: React.FC<DialectStudioProps> = ({
       });
       const data = await res.json();
       if (!res.ok) {
+        if ((res.status === 503 || res.status === 429 || data.retryable) && installedPack) {
+          await runLocalAudioFallback(
+            `Cloud AI is experiencing high demand (${res.status}). Automatically transcribed & translated using your local ${installedPack.dialectName} pack.`
+          );
+          return;
+        }
+        if (res.status === 503 || res.status === 429 || data.retryable) {
+          setOfferOfflineAction('audio');
+        }
         throw new Error(data.error || 'Server transcription failed.');
       }
 
@@ -455,6 +473,16 @@ export const DialectStudio: React.FC<DialectStudioProps> = ({
         text: 'Audio transcribed, translated, and evaluated for WER/CER accuracy.',
       });
     } catch (err) {
+      if (installedPack && isOnline) {
+        try {
+          await runLocalAudioFallback(
+            `Cloud connection interrupted. Automatically switched to your local ${installedPack.dialectName} offline pack.`
+          );
+          return;
+        } catch {
+          // fall through to banner
+        }
+      }
       setStatusBanner({
         type: 'error',
         text: err instanceof Error ? err.message : 'Audio processing failed.',
@@ -471,23 +499,29 @@ export const DialectStudio: React.FC<DialectStudioProps> = ({
     }
     setIsProcessing(true);
     setStatusBanner(null);
+    setOfferOfflineAction(null);
+
+    const runLocalTextFallback = (pack: LanguagePack, bannerText: string) => {
+      const localRes = runOfflineTranslation(sourceTranscript, pack, targetLanguage);
+      setTranslatedText(localRes.translatedText);
+      setPhoneticIpa(localRes.phoneticIpa);
+      setGrammarNotes(localRes.grammarSuggestions);
+      setModelTag(`Offline Pack (${pack.iso} v${pack.version})`);
+      setStatusBanner({
+        type: 'info',
+        text: bannerText,
+      });
+    };
 
     try {
       if (!isOnline) {
         if (!installedPack) {
+          setOfferOfflineAction('text');
           throw new Error(
             `Offline translation requires downloading the ${activeDialect.name} language pack first.`
           );
         }
-        const localRes = runOfflineTranslation(sourceTranscript, installedPack, targetLanguage);
-        setTranslatedText(localRes.translatedText);
-        setPhoneticIpa(localRes.phoneticIpa);
-        setGrammarNotes(localRes.grammarSuggestions);
-        setModelTag(`Offline Pack (${installedPack.iso} v${installedPack.version})`);
-        setStatusBanner({
-          type: 'info',
-          text: `Translated offline using downloaded ${installedPack.dialectName} pack.`,
-        });
+        runLocalTextFallback(installedPack, `Translated offline using downloaded ${installedPack.dialectName} pack.`);
         return;
       }
 
@@ -501,7 +535,19 @@ export const DialectStudio: React.FC<DialectStudioProps> = ({
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Translation failed.');
+      if (!res.ok) {
+        if ((res.status === 503 || res.status === 429 || data.retryable) && installedPack) {
+          runLocalTextFallback(
+            installedPack,
+            `Cloud AI is experiencing high demand (${res.status}). Automatically translated using your local ${installedPack.dialectName} pack.`
+          );
+          return;
+        }
+        if (res.status === 503 || res.status === 429 || data.retryable) {
+          setOfferOfflineAction('text');
+        }
+        throw new Error(data.error || 'Translation failed.');
+      }
 
       setTranslatedText(data.translatedText || '');
       setPhoneticIpa(data.phoneticIpa || '');
@@ -509,12 +555,57 @@ export const DialectStudio: React.FC<DialectStudioProps> = ({
       setModelTag(data.modelUsed || 'gemini-4-hydrogen');
       setStatusBanner({ type: 'success', text: `Translated ${activeDialect.name} to ${targetLanguage}.` });
     } catch (err) {
+      if (installedPack && isOnline) {
+        runLocalTextFallback(
+          installedPack,
+          `Cloud translation temporarily unavailable. Translated using your local ${installedPack.dialectName} pack.`
+        );
+        return;
+      }
       setStatusBanner({
         type: 'error',
         text: err instanceof Error ? err.message : 'Translation failed.',
       });
     } finally {
       setIsProcessing(false);
+    }
+  };
+
+  const handleDownloadAndTranslateOffline = async () => {
+    setPackBusy(true);
+    try {
+      const pack = installedPack || (await downloadLanguagePack(selectedDialectId));
+      await onPacksChanged();
+      setOfferOfflineAction(null);
+      if (offerOfflineAction === 'audio' && audioBlob) {
+        const localRes = runOfflineAudioTranscription(pack, liveSpeechPreview, targetLanguage);
+        setSourceTranscript(localRes.sourceTranscript);
+        setTranslatedText(localRes.translatedText);
+        setPhoneticIpa(localRes.phoneticIpa);
+        setGrammarNotes(localRes.grammarSuggestions);
+        setModelTag(`Offline Local Pack (${pack.iso} v${pack.version})`);
+        setStatusBanner({
+          type: 'info',
+          text: `Installed ${pack.dialectName} pack (${pack.sizeKb} KB) and translated audio locally.`,
+        });
+      } else {
+        const localRes = runOfflineTranslation(sourceTranscript, pack, targetLanguage);
+        setTranslatedText(localRes.translatedText);
+        setPhoneticIpa(localRes.phoneticIpa);
+        setGrammarNotes(localRes.grammarSuggestions);
+        setModelTag(`Offline Pack (${pack.iso} v${pack.version})`);
+        setStatusBanner({
+          type: 'info',
+          text: `Installed ${pack.dialectName} pack (${pack.sizeKb} KB) and translated locally.`,
+        });
+      }
+    } catch (err) {
+      setStatusBanner({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to install offline language pack.',
+      });
+    } finally {
+      setPackBusy(false);
     }
   };
 
@@ -995,7 +1086,7 @@ export const DialectStudio: React.FC<DialectStudioProps> = ({
 
         {statusBanner && (
           <div
-            className={`mt-4 flex items-start gap-2.5 rounded-xl border px-4 py-3 text-sm ${
+            className={`mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border px-4 py-3 text-sm ${
               statusBanner.type === 'error'
                 ? 'border-red-200 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 text-red-800 dark:text-red-200'
                 : statusBanner.type === 'info'
@@ -1003,8 +1094,21 @@ export const DialectStudio: React.FC<DialectStudioProps> = ({
                 : 'border-teal-200 dark:border-teal-900/60 bg-teal-50 dark:bg-teal-950/40 text-teal-800 dark:text-teal-200'
             }`}
           >
-            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-            <span>{statusBanner.text}</span>
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span>{statusBanner.text}</span>
+            </div>
+            {offerOfflineAction && !installedPack && (
+              <button
+                type="button"
+                disabled={packBusy}
+                onClick={handleDownloadAndTranslateOffline}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-medium hover:opacity-90 whitespace-nowrap shrink-0 min-h-[36px]"
+              >
+                <HardDriveDownload className="w-3.5 h-3.5" />
+                {packBusy ? 'Installing Pack...' : 'Download Offline Pack & Translate'}
+              </button>
+            )}
           </div>
         )}
       </div>
